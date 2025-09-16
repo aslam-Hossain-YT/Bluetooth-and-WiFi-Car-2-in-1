@@ -1,0 +1,172 @@
+/*
+   ESP32 WiFi Car Control – BTS7960 Version
+   LPWM1 = GPIO33
+   RPWM1 = GPIO25
+   LPWM2 = GPIO26
+   RPWM2 = GPIO27
+*/
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <iostream>
+#include <sstream>
+
+// ---------------- Motor Pin & Channel Setup ----------------
+struct MOTOR_PINS {
+  int lpwm;     // Forward PWM
+  int rpwm;     // Reverse PWM
+  int chL;      // LEDC channel for forward
+  int chR;      // LEDC channel for reverse
+};
+
+MOTOR_PINS motors[2] = {
+  // RIGHT motor
+  {26, 27, 0, 1},
+  // LEFT motor
+  {33, 25, 2, 3}
+};
+
+// ---------------- WiFi & Command Definitions ----------------
+const char* ssid     = "Mini_Soccer_Bot";
+const char* password = "12345678";
+
+#define UP 1
+#define DOWN 2
+#define LEFT 3
+#define RIGHT 4
+#define STOP 0
+#define FORWARD_LEFT 5
+#define FORWARD_RIGHT 6
+#define BACKWARD_LEFT 7
+#define BACKWARD_RIGHT 8
+
+#define RIGHT_MOTOR 0
+#define LEFT_MOTOR  1
+
+const int PWMFreq = 1000;
+const int PWMResolution = 8;   // 0-255
+
+AsyncWebServer server(80);
+AsyncWebSocket wsCarInput("/CarInput");
+
+// ---------------- HTML UI ----------------
+const char* htmlHomePage PROGMEM = R"HTML(
+<!DOCTYPE html>
+<html>
+<head><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body{background:#fdfd96;font-family:Arial;margin:0;display:flex;justify-content:center;align-items:center;height:100vh;}
+.layout{display:flex;flex-direction:row;gap:30px}
+.column{display:flex;flex-direction:column;gap:20px}
+.row{display:flex;gap:20px}
+.button{width:120px;height:120px;background:#fff;border-radius:10px;box-shadow:5px 5px #888;display:flex;align-items:center;justify-content:center;user-select:none}
+.button:active{transform:translate(5px,5px);box-shadow:none}
+.slider{width:100%}
+</style></head>
+<body>
+<div class="layout">
+  <div class="column">
+    <div class="button" ontouchstart='send("MoveCar","1")' ontouchend='send("MoveCar","0")'></div>
+    <div class="button" ontouchstart='send("MoveCar","2")' ontouchend='send("MoveCar","0")'></div>
+  </div>
+  <div class="column">
+    <input type="range" min="0" max="255" value="150" class="slider" id="Speed" oninput='send("Speed",value)'>
+    <div class="row">
+      <div class="button" ontouchstart='send("MoveCar","3")' ontouchend='send("MoveCar","0")'></div>
+      <div class="button" ontouchstart='send("MoveCar","4")' ontouchend='send("MoveCar","0")'></div>
+    </div>
+  </div>
+</div>
+<script>
+var socket;
+function connect(){
+  socket=new WebSocket("ws://"+location.host+"/CarInput");
+  socket.onopen=()=>send("Speed",document.getElementById("Speed").value);
+  socket.onclose=()=>setTimeout(connect,2000);
+}
+function send(k,v){if(socket&&socket.readyState===1)socket.send(k+","+v);}
+window.onload=connect;
+</script>
+</body></html>
+)HTML";
+
+// ---------------- Motor Control Helpers ----------------
+void driveMotor(int m, int dir, int spd) {
+  // dir: 1 forward, -1 backward, 0 stop
+  if (dir == 1) {
+    ledcWrite(motors[m].chL, spd);
+    ledcWrite(motors[m].chR, 0);
+  } else if (dir == -1) {
+    ledcWrite(motors[m].chL, 0);
+    ledcWrite(motors[m].chR, spd);
+  } else {
+    ledcWrite(motors[m].chL, 0);
+    ledcWrite(motors[m].chR, 0);
+  }
+}
+
+int currentSpeed = 150;
+
+void moveCar(int cmd) {
+  switch (cmd) {
+    case UP:            driveMotor(RIGHT_MOTOR, 1, currentSpeed); driveMotor(LEFT_MOTOR, 1, currentSpeed); break;
+    case DOWN:          driveMotor(RIGHT_MOTOR,-1, currentSpeed); driveMotor(LEFT_MOTOR,-1, currentSpeed); break;
+    case LEFT:          driveMotor(RIGHT_MOTOR, 1, currentSpeed); driveMotor(LEFT_MOTOR,-1, currentSpeed); break;
+    case RIGHT:         driveMotor(RIGHT_MOTOR,-1, currentSpeed); driveMotor(LEFT_MOTOR, 1, currentSpeed); break;
+    case FORWARD_LEFT:  driveMotor(RIGHT_MOTOR, 1, currentSpeed); driveMotor(LEFT_MOTOR, 0, 0);            break;
+    case FORWARD_RIGHT: driveMotor(RIGHT_MOTOR, 0, 0);            driveMotor(LEFT_MOTOR, 1, currentSpeed); break;
+    case BACKWARD_LEFT: driveMotor(RIGHT_MOTOR,-1, currentSpeed); driveMotor(LEFT_MOTOR, 0, 0);            break;
+    case BACKWARD_RIGHT:driveMotor(RIGHT_MOTOR, 0, 0);            driveMotor(LEFT_MOTOR,-1, currentSpeed); break;
+    default:            driveMotor(RIGHT_MOTOR, 0, 0);            driveMotor(LEFT_MOTOR, 0, 0);            break;
+  }
+}
+
+// ---------------- WebSocket ----------------
+void onCarInputWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
+                              AwsEventType type, void *arg, uint8_t *data, size_t len) {
+  if (type == WS_EVT_DATA) {
+    AwsFrameInfo *info = (AwsFrameInfo*)arg;
+    if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
+      std::string msg((char *)data, len);
+      std::istringstream ss(msg);
+      std::string key, value;
+      getline(ss, key, ',');
+      getline(ss, value, ',');
+      int val = atoi(value.c_str());
+      if (key == "MoveCar")       moveCar(val);
+      else if (key == "Speed")   { currentSpeed = val; }
+    }
+  } else if (type == WS_EVT_DISCONNECT) {
+    moveCar(STOP);
+  }
+}
+
+// ---------------- Setup & Loop ----------------
+void setup() {
+  Serial.begin(115200);
+
+  // Initialize pins and PWM channels
+  for (auto &m : motors) {
+    pinMode(m.lpwm, OUTPUT);
+    pinMode(m.rpwm, OUTPUT);
+    ledcSetup(m.chL, PWMFreq, PWMResolution);
+    ledcSetup(m.chR, PWMFreq, PWMResolution);
+    ledcAttachPin(m.lpwm, m.chL);
+    ledcAttachPin(m.rpwm, m.chR);
+  }
+
+  WiFi.softAP(ssid, password);
+  Serial.println(WiFi.softAPIP());
+
+  wsCarInput.onEvent(onCarInputWebSocketEvent);
+  server.addHandler(&wsCarInput);
+  server.on("/", [](AsyncWebServerRequest *req){ req->send_P(200, "text/html", htmlHomePage); });
+  server.begin();
+}
+
+void loop() {
+  // nothing – all event-driven
+}
+
